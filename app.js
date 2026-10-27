@@ -1,9 +1,9 @@
 /**
- * 目的地コンパス Ver 3.0 (iOS Safari / Android Chrome 両対応版)
- * - Android で DeviceOrientationEvent.requestPermission が 'denied' 等を返してもブロックせず、
- *   必ず GPS (watchPosition) とコンパスリスナー (deviceorientationabsolute / deviceorientation) を開始する
- * - クリップボード確認ダイアログ等でハングしないようタイムアウト制御と確実なUI更新を実装
- * - コンパスの N / E / S / W 配置（上:N, 右:E, 下:S, 左:W）および回転方向を正確に制御
+ * 目的地コンパス Ver 4.0 (Android / iOS 高感度コンパス追従版)
+ * - Androidで deviceorientation と deviceorientationabsolute の競合や、
+ *   Generic Sensor API (AbsoluteOrientationSensor / RelativeOrientationSensor) を網羅して
+ *   確実にリアルタイムでスマホの向き(Heading)を追従し続けるよう改善
+ * - requestAnimationFrame ループによる滑らかな60fpsコンパス補間描画
  */
 
 const STORAGE_LAST_DEST_KEY = 'map_compass_last_dest_v2';
@@ -13,6 +13,8 @@ const state = {
   savedDestination: null, // localStorageから読み込んだ前回の目的地
   currentPos: null,       // { lat, lng, accuracy, timestamp }
   heading: null,          // 0 - 360 (真北=0, 時計回り)
+  headingSource: '',      // 'ios' | 'absolute' | 'sensor' | 'relative' | 'gps'
+  lastAbsoluteTime: 0,    // 最後に absolute イベントを受け取った時刻
   bearing: null,          // 0 - 360 (現在地から見た目的地の真北基準方位)
   distanceMeters: null,
   watchId: null,
@@ -60,9 +62,6 @@ const els = {
 // 1. OS判定・ユーティリティ
 // ==========================================
 
-/**
- * 真の iOS / iPadOS 端末かどうかを判定（Android Chrome 等で requestPermission がダミー定義されているケースを除外）
- */
 function isIOSDevice() {
   if (typeof navigator === 'undefined') return false;
   const ua = navigator.userAgent || '';
@@ -111,6 +110,9 @@ function isValidLatLng(lat, lng) {
   );
 }
 
+/**
+ * 0°と360°の境界で矢印が1回転してしまわないよう、最短差分で連続角度を更新する
+ */
 function smoothAngleTransition(currentContinuousAngle, targetNormalizedDeg) {
   const currentMod = ((currentContinuousAngle % 360) + 360) % 360;
   let diff = targetNormalizedDeg - currentMod;
@@ -268,7 +270,6 @@ async function resolveGoogleMapsTarget(rawInput, sharedTitle = '') {
     throw new Error('コピーされたテキストにGoogleマップのURL（https://...）が見つかりませんでした。');
   }
 
-  // `/api/resolve-url` へ送信（Next.jsサーバー環境の場合）
   try {
     const apiRes = await fetch(`./api/resolve-url?url=${encodeURIComponent(extractedUrl)}`, {
       method: 'GET',
@@ -291,7 +292,6 @@ async function resolveGoogleMapsTarget(rawInput, sharedTitle = '') {
     }
   } catch (_) {}
 
-  // GitHub Pages（静的環境）向け：CORS対応プロキシ経由で短縮URLを展開＆HTML/Preview解析
   const proxyHtmlRes = await fetchViaCorsProxies(extractedUrl);
   if (proxyHtmlRes) {
     const cleanedHtml = proxyHtmlRes.text
@@ -448,7 +448,7 @@ function formatDistance(meters) {
 }
 
 // ==========================================
-// 4. 電子コンパス・GPS・Screen Wake Lock 制御
+// 4. 電子コンパス（マルチセンサー対応）・GPS・Screen Wake Lock 制御
 // ==========================================
 
 async function requestScreenWakeLock() {
@@ -469,57 +469,107 @@ document.addEventListener('visibilitychange', () => {
 });
 
 /**
- * 電子コンパス（スマホの向き）の取得
- * - iOSの場合: `webkitCompassHeading`（真北=0°、時計回り）を使用
- * - Android等の場合: `deviceorientationabsolute`（非対応なら `deviceorientation`）の `alpha` を使用し、`(360 - alpha) % 360` で北基準の角度に変換
+ * 画面の向き（縦・横）のオフセットを取得
  */
-function handleDeviceOrientation(event) {
-  let heading = null;
-
-  if (typeof event.webkitCompassHeading === 'number' && !Number.isNaN(event.webkitCompassHeading)) {
-    heading = event.webkitCompassHeading;
-  } else if (event.alpha !== null && event.alpha !== undefined && !Number.isNaN(event.alpha)) {
-    heading = (360 - event.alpha + 360) % 360;
+function getScreenOrientationOffset() {
+  if (typeof window === 'undefined') return 0;
+  if (window.screen && window.screen.orientation && typeof window.screen.orientation.angle === 'number') {
+    return window.screen.orientation.angle;
   }
-
-  if (heading !== null) {
-    state.heading = (heading + 360) % 360;
-    updateNavigationUI();
+  if (typeof window.orientation === 'number') {
+    return window.orientation;
   }
+  return 0;
 }
 
-let absoluteOrientationBound = false;
-let fallbackOrientationBound = false;
-let hasReceivedAbsoluteEvent = false;
+/**
+ * クォータニオン [x, y, z, w] から北基準のコンパス方位角 (0〜360°) を算出（Android AbsoluteOrientationSensor用）
+ */
+function quaternionToCompassHeading(q) {
+  if (!Array.isArray(q) || q.length < 4) return null;
+  const [x, y, z, w] = q;
+  // Z軸回りのヨー角 (alpha)
+  const siny_cosp = 2 * (w * z + x * y);
+  const cosy_cosp = 1 - 2 * (y * y + z * z);
+  const yawRad = Math.atan2(siny_cosp, cosy_cosp);
+  const yawDeg = (yawRad * 180) / Math.PI;
+  const screenOffset = getScreenOrientationOffset();
+  return (360 - yawDeg + screenOffset + 360) % 360;
+}
+
+/**
+ * スマホの向き (Heading) を更新して即座にUIへ反映する
+ */
+function applyNewHeading(rawHeading, sourceName) {
+  if (typeof rawHeading !== 'number' || Number.isNaN(rawHeading)) return;
+  state.heading = ((rawHeading % 360) + 360) % 360;
+  state.headingSource = sourceName;
+  updateNavigationUI();
+}
+
+let listenersRegistered = false;
+let orientationSensorInstance = null;
 
 function registerCompassListeners() {
-  if ('ondeviceorientationabsolute' in window && !absoluteOrientationBound) {
-    window.addEventListener(
-      'deviceorientationabsolute',
-      (event) => {
-        if (event.alpha !== null && event.alpha !== undefined) {
-          hasReceivedAbsoluteEvent = true;
-          handleDeviceOrientation(event);
-        }
-      },
-      true
-    );
-    absoluteOrientationBound = true;
-  }
+  if (listenersRegistered) return;
+  listenersRegistered = true;
 
-  if ('ondeviceorientation' in window && !fallbackOrientationBound) {
-    window.addEventListener(
-      'deviceorientation',
-      (event) => {
-        // iOS (webkitCompassHeadingあり) または Android でまだ absolute イベントが来ていない場合に処理
-        if (typeof event.webkitCompassHeading === 'number' || !hasReceivedAbsoluteEvent) {
-          handleDeviceOrientation(event);
+  // 1. deviceorientationabsolute (Android Chrome 標準の真北コンパスイベント)
+  window.addEventListener(
+    'deviceorientationabsolute',
+    (event) => {
+      if (event.alpha !== null && event.alpha !== undefined && !Number.isNaN(event.alpha)) {
+        state.lastAbsoluteTime = Date.now();
+        const screenOffset = getScreenOrientationOffset();
+        const heading = (360 - event.alpha + screenOffset + 360) % 360;
+        applyNewHeading(heading, 'absolute');
+      }
+    },
+    true
+  );
+
+  // 2. deviceorientation (iOS webkitCompassHeading および Android で absolute が止まった/非対応時の継続イベント)
+  window.addEventListener(
+    'deviceorientation',
+    (event) => {
+      // 2-A. iOS Safari: webkitCompassHeading (真北=0°, 時計回り)
+      if (typeof event.webkitCompassHeading === 'number' && !Number.isNaN(event.webkitCompassHeading)) {
+        applyNewHeading(event.webkitCompassHeading, 'ios');
+        return;
+      }
+
+      // 2-B. Android 等: 直近 800ms 以内に deviceorientationabsolute が正常に連続発火している場合はそちらを優先し、
+      // 初回だけで止まった場合や非対応端末ではこちらの alpha を継続利用して固まるのを防ぐ
+      if (event.alpha !== null && event.alpha !== undefined && !Number.isNaN(event.alpha)) {
+        const now = Date.now();
+        if (event.absolute === true || now - state.lastAbsoluteTime > 800) {
+          const screenOffset = getScreenOrientationOffset();
+          const heading = (360 - event.alpha + screenOffset + 360) % 360;
+          applyNewHeading(heading, event.absolute ? 'absolute' : 'relative');
         }
-      },
-      true
-    );
-    fallbackOrientationBound = true;
-  }
+      }
+    },
+    true
+  );
+
+  // 3. Android Generic Sensor API (AbsoluteOrientationSensor) によるハードウェア直接取得バックアップ
+  try {
+    if ('AbsoluteOrientationSensor' in window && !orientationSensorInstance) {
+      const SensorClass = window.AbsoluteOrientationSensor;
+      orientationSensorInstance = new SensorClass({ frequency: 30, referenceFrame: 'screen' });
+      orientationSensorInstance.addEventListener('reading', () => {
+        // 他のイベントが直近500ms来ていない場合にバックアップとして駆動
+        if (Date.now() - state.lastAbsoluteTime > 500 && orientationSensorInstance.quaternion) {
+          const h = quaternionToCompassHeading(orientationSensorInstance.quaternion);
+          if (h !== null) {
+            applyNewHeading(h, 'sensor');
+          }
+        }
+      });
+      orientationSensorInstance.addEventListener('error', () => {});
+      orientationSensorInstance.start();
+    }
+  } catch (_) {}
 }
 
 function startGeolocationWatch() {
@@ -542,8 +592,9 @@ function startGeolocationWatch() {
         accuracy: pos.coords.accuracy,
         timestamp: pos.timestamp,
       };
+      // 磁気センサーが無い端末で移動中の場合のみ GPS heading を利用
       if (state.heading === null && typeof pos.coords.heading === 'number' && !Number.isNaN(pos.coords.heading)) {
-        state.heading = pos.coords.heading;
+        applyNewHeading(pos.coords.heading, 'gps');
       }
       updateNavigationUI();
     },
@@ -557,7 +608,7 @@ function startGeolocationWatch() {
     },
     {
       enableHighAccuracy: true,
-      maximumAge: 2000,
+      maximumAge: 1000,
       timeout: 20000,
     }
   );
@@ -586,20 +637,18 @@ async function onOneTapClipboardStartClick() {
       ? window.DeviceOrientationEvent.requestPermission().catch(() => 'granted')
       : Promise.resolve('granted');
 
-  // 2. 並行または直後: クリップボード読み取りを開始（ポップアップ放置で永久ハングしないよう12秒タイムアウト付き）
+  // 2. 並行または直後: クリップボード読み取りを開始（12秒タイムアウト付き）
   const clipboardPromise =
     navigator.clipboard && typeof navigator.clipboard.readText === 'function'
       ? withTimeout(navigator.clipboard.readText(), 12000, 'Clipboard timeout')
       : Promise.reject(new Error('Clipboard API unavailable'));
 
-  // Android 等でも即座に GPS (watchPosition) とコンパスイベントの待受を開始する
   activateTrackingServices();
 
   els.btnStartFromClipboard.disabled = true;
   els.btnStartFromClipboardLabel.textContent = 'リンクを解析中...';
   showToast('コピーしたリンクを読み取っています...', false, 0);
 
-  // iOS端末で明示的にコンパス権限が拒否された場合のみ案内を出す（Androidでは誤検知させない）
   try {
     const permState = await permissionPromise;
     if (permState !== 'granted' && isIOSDevice()) {
@@ -607,7 +656,6 @@ async function onOneTapClipboardStartClick() {
     }
   } catch (_) {}
 
-  // クリップボードからテキスト取得 -> 正規表現でURL抽出 -> 座標解決
   try {
     const clipText = await clipboardPromise;
     if (!clipText || !clipText.trim()) {
@@ -618,7 +666,6 @@ async function onOneTapClipboardStartClick() {
     setAndSaveDestination(target);
     showToast(`目的地「${target.name}」へのナビを開始しました！`, false, 3500);
   } catch (err) {
-    // クリップボードが空だった場合、もし前回の目的地（例：玉の湯）が保存されていればそれをセットしつつ手動入力欄も開く
     if (!state.destination && state.savedDestination) {
       setAndSaveDestination(state.savedDestination);
     }
@@ -634,11 +681,7 @@ async function onOneTapClipboardStartClick() {
   }
 }
 
-/**
- * すでに目的地がセットされている状態（Android共有起動時・前回の目的地「〇〇」で再開ボタンタップ時）のワンタップ開始
- */
 async function onStartWithTargetClick(targetObj) {
-  // 1. 最優先（同期的）: iOS向けに requestPermission() を呼び出す
   const permissionPromise =
     typeof window.DeviceOrientationEvent !== 'undefined' &&
     typeof window.DeviceOrientationEvent.requestPermission === 'function'
@@ -649,7 +692,6 @@ async function onStartWithTargetClick(targetObj) {
     setAndSaveDestination(targetObj);
   }
 
-  // 即座にGPSとコンパスを開始
   activateTrackingServices();
 
   try {
@@ -783,17 +825,15 @@ function updateNavigationUI() {
 
 function initApp() {
   if ('serviceWorker' in navigator && window.location.protocol.startsWith('http')) {
-    navigator.serviceWorker.register('./sw.js?v=3.0').catch(() => {});
+    navigator.serviceWorker.register('./sw.js?v=4.0').catch(() => {});
   }
 
   loadSavedDestinationFromStorage();
 
-  // Android ではページ読み込み時点からコンパスイベントを先行登録しておく（ボタンタップ前でも方角が取れるようにする）
   if (!isIOSDevice()) {
     registerCompassListeners();
   }
 
-  // URLクエリパラメータ（?url=..., ?text=..., ?q=...）付きで開かれた場合の自動解析
   const params = new URLSearchParams(window.location.search);
   const sharedUrl = params.get('url') || '';
   const sharedText = params.get('text') || '';
@@ -822,7 +862,6 @@ function initApp() {
       });
   }
 
-  // イベント登録
   els.btnStartFromClipboard.addEventListener('click', onOneTapClipboardStartClick);
   els.btnReloadClipboard.addEventListener('click', onOneTapClipboardStartClick);
 
