@@ -1,4 +1,4 @@
-const CACHE_NAME = 'map-compass-pwa-v1';
+const CACHE_NAME = 'map-compass-pwa-v3';
 const ASSETS = [
   './',
   './index.html',
@@ -27,13 +27,12 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
 
   const url = new URL(req.url);
-  // API request or cross-origin requests should always go to network
   if (url.pathname.includes('/api/') || url.origin !== self.location.origin) {
     return;
   }
 
   event.respondWith(
-    fetch(req)
+    fetch(req, { cache: 'no-store' })
       .then((res) => {
         const copy = res.clone();
         caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
