@@ -70,6 +70,33 @@ function isIOSDevice(): boolean {
   return (isAppleMobile || isIPadOS) && !/Android/i.test(ua);
 }
 
+function computeTiltCompensatedHeading(alpha: number, beta: number | null, gamma: number | null): number {
+  const degToRad = Math.PI / 180;
+  const _x = (beta ?? 0) * degToRad;
+  const _y = (gamma ?? 0) * degToRad;
+  const _z = (alpha ?? 0) * degToRad;
+
+  const cX = Math.cos(_x);
+  const cY = Math.cos(_y);
+  const cZ = Math.cos(_z);
+  const sX = Math.sin(_x);
+  const sY = Math.sin(_y);
+  const sZ = Math.sin(_z);
+
+  const Vx = -cZ * sY - sZ * sX * cY;
+  const Vy = -sZ * sY + cZ * sX * cY;
+
+  if (Math.hypot(Vx, Vy) < 0.15) {
+    return (360 - alpha + 360) % 360;
+  }
+
+  let compassHeadingRad = Math.atan(Vx / Vy);
+  if (Vy < 0) compassHeadingRad += Math.PI;
+  else if (Vx < 0) compassHeadingRad += 2 * Math.PI;
+
+  return (compassHeadingRad * (180 / Math.PI) + 360) % 360;
+}
+
 function smoothAngle(prevContinuous: number, nextTargetNormalized: number): number {
   const currentMod = ((prevContinuous % 360) + 360) % 360;
   let diff = nextTargetNormalized - currentMod;
@@ -293,8 +320,8 @@ function CompassMainContent() {
       // iOSの場合: webkitCompassHeading（真北=0°、時計回り）を使用
       nextHeading = e.webkitCompassHeading;
     } else if (e.alpha !== null && e.alpha !== undefined && !Number.isNaN(e.alpha)) {
-      // Android等の場合: alpha を使用し (360 - alpha) % 360 で北基準の角度に変換
-      nextHeading = (360 - e.alpha + 360) % 360;
+      // Android等の場合: 3軸オイラー角 (alpha, beta, gamma) からチルト補正付き真北方位角を算出
+      nextHeading = computeTiltCompensatedHeading(e.alpha, e.beta, e.gamma);
     }
 
     if (nextHeading !== null) {
