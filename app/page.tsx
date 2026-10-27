@@ -62,6 +62,14 @@ function degToCompassLabel(deg: number | null): string {
 /**
  * 要件5: 0°と360°の境界で矢印が1回転してしまわないよう、最短経路でスムーズに回転する角度補間
  */
+function isIOSDevice(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  const ua = navigator.userAgent || '';
+  const isAppleMobile = /iPad|iPhone|iPod/.test(ua);
+  const isIPadOS = navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1;
+  return (isAppleMobile || isIPadOS) && !/Android/i.test(ua);
+}
+
 function smoothAngle(prevContinuous: number, nextTargetNormalized: number): number {
   const currentMod = ((prevContinuous % 360) + 360) % 360;
   let diff = nextTargetNormalized - currentMod;
@@ -356,19 +364,18 @@ function CompassMainContent() {
     setIsResolving(true);
     setStatusMessage({ text: 'コンパス有効化とコピー済みリンクの読み取りを実行中...' });
 
+    activateTrackingListeners();
+
     try {
       const permState = await permissionPromise;
-      if (permState === 'granted') {
-        activateTrackingListeners();
-      } else {
+      if (permState !== 'granted' && isIOSDevice()) {
         setStatusMessage({
-          text: 'コンパスの権限が拒否されました。Safariを再読み込みして許可してください。',
+          text: 'iOSコンパスの権限が拒否されました。Safariを再読み込みして許可してください。',
           isError: true,
         });
       }
     } catch {
-      // デスクトップ等で requestPermission が例外を投げた場合でもそのまま続行
-      activateTrackingListeners();
+      // デスクトップ・Android等で requestPermission が例外を投げた場合もそのまま続行
     }
 
     // 3 & 4. クリップボードからテキスト取得 -> 正規表現でURL抽出 -> /api/resolve-url で座標解決
@@ -411,19 +418,19 @@ function CompassMainContent() {
         : Promise.resolve('granted' as const);
 
     saveDestination(targetToUse);
+    activateTrackingListeners();
 
     try {
       const perm = await permissionPromise;
-      if (perm !== 'granted') {
+      if (perm !== 'granted' && isIOSDevice()) {
         setStatusMessage({
-          text: 'コンパスの利用が拒否されました。Safariを再読み込みして許可してください。',
+          text: 'iOSコンパスの利用が拒否されました。Safariを再読み込みして許可してください。',
           isError: true,
         });
         return;
       }
     } catch {}
 
-    activateTrackingListeners();
     setStatusMessage({ text: `「${targetToUse.name}」へのリアルタイム計測を開始しました！` });
   };
 
