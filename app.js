@@ -1,13 +1,9 @@
 /**
- * 目的地コンパス Ver 2.0
- * - 要件2: 「コピーしたリンクから開始」ワンタップボタン（iOS SafariのUser Activation制約を回避する実装順序）
- *   1. 最優先（同期的）: DeviceOrientationEvent.requestPermission() を最初に呼び出す
- *   2. 並行または直後: navigator.clipboard.readText() でクリップボードを取得
- *   3. 正規表現 https?://[^\s]+ でURL抽出
- *   4. /api/resolve-url（および静的環境用CORSフォールバック）で座標取得 -> 即座にトラッキング開始
- *   5. クリップボード読取失敗時は手動入力フォームを自動展開してフォーカス
- * - 要件3: Android PWA Web Share Target (?url=, ?text=, ?q=) 自動解析 + 「コンパスを有効にして開始」1タップ開始
- * - 要件6: Screen Wake Lock API (navigator.wakeLock.request('screen')) + localStorage 前回目的地のワンタップ再開
+ * 目的地コンパス Ver 3.0 (iOS Safari / Android Chrome 両対応版)
+ * - Android で DeviceOrientationEvent.requestPermission が 'denied' 等を返してもブロックせず、
+ *   必ず GPS (watchPosition) とコンパスリスナー (deviceorientationabsolute / deviceorientation) を開始する
+ * - クリップボード確認ダイアログ等でハングしないようタイムアウト制御と確実なUI更新を実装
+ * - コンパスの N / E / S / W 配置（上:N, 右:E, 下:S, 左:W）および回転方向を正確に制御
  */
 
 const STORAGE_LAST_DEST_KEY = 'map_compass_last_dest_v2';
@@ -61,8 +57,20 @@ const els = {
 };
 
 // ==========================================
-// 1. ユーティリティ
+// 1. OS判定・ユーティリティ
 // ==========================================
+
+/**
+ * 真の iOS / iPadOS 端末かどうかを判定（Android Chrome 等で requestPermission がダミー定義されているケースを除外）
+ */
+function isIOSDevice() {
+  if (typeof navigator === 'undefined') return false;
+  const ua = navigator.userAgent || '';
+  const isAppleMobile = /iPad|iPhone|iPod/.test(ua);
+  const isIPadOS = navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1;
+  return (isAppleMobile || isIPadOS) && !/Android/i.test(ua);
+}
+
 let toastTimer = null;
 function showToast(message, isError = false, durationMs = 4500) {
   if (!els.statusToast) return;
@@ -103,9 +111,6 @@ function isValidLatLng(lat, lng) {
   );
 }
 
-/**
- * 要件5: 0°と360°の境界で矢印が1回転してしまわないよう、スムーズに回転する角度補間
- */
 function smoothAngleTransition(currentContinuousAngle, targetNormalizedDeg) {
   const currentMod = ((currentContinuousAngle % 360) + 360) % 360;
   let diff = targetNormalizedDeg - currentMod;
@@ -114,13 +119,26 @@ function smoothAngleTransition(currentContinuousAngle, targetNormalizedDeg) {
   return currentContinuousAngle + diff;
 }
 
+function withTimeout(promise, ms, errorMessage) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(errorMessage)), ms);
+    promise.then(
+      (val) => {
+        clearTimeout(timer);
+        resolve(val);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 // ==========================================
-// 2. 文字列からのURL抽出 & 座標抽出ロジック（要件2・要件4）
+// 2. 文字列からのURL抽出 & 座標抽出ロジック
 // ==========================================
 
-/**
- * 要件2-3: 取得した文字列から正規表現（`https?://[^\s]+`）でURL部分だけを抽出する
- */
 function parseSharedInput(rawInput, sharedTitle = '') {
   const text = (rawInput || '').trim();
   const urlMatch = text.match(/https?:\/\/[^\s"<>]+/i);
@@ -145,13 +163,6 @@ function parseSharedInput(rawInput, sharedTitle = '') {
   };
 }
 
-/**
- * 要件4: 以下の正規表現パターン（優先度順）で緯度（lat）・経度（lng）を抽出する
- * 1. ピンの正確な座標: `!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)`
- * 2. クエリ形式の座標: `[?&](?:q|ll|query|destination)=(-?\d+\.\d+),(-?\d+\.\d+)`
- * 3. ビューポート中心座標: `@(-?\d+\.\d+),(-?\d+\.\d+)`
- * 4. HTML内のメタデータ等に含まれる座標パターン
- */
 function extractCoordinatesFromText(sourceStr) {
   if (!sourceStr) return null;
 
@@ -206,7 +217,6 @@ function extractCoordinatesFromText(sourceStr) {
     }
   }
 
-  // 直接の座標文字列入力（例: "35.65858, 139.74543"）
   const matchRawCoords = sourceStr.trim().match(/^(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)$/);
   if (matchRawCoords) {
     const lat = parseFloat(matchRawCoords[1]);
@@ -239,14 +249,9 @@ function extractPlaceNameFromUrl(urlStr) {
   return '';
 }
 
-/**
- * 要件2-4 & 要件4: 抽出したURLを `/api/resolve-url` へ送信して目的地の緯度・経度を取得
- * （GitHub Pages等の静的ホスティング時は自動でCORSプロキシ展開へフォールバック）
- */
 async function resolveGoogleMapsTarget(rawInput, sharedTitle = '') {
   const { rawText, extractedUrl, candidateName } = parseSharedInput(rawInput, sharedTitle);
 
-  // 1. まず入力テキストやURL自体に座標が含まれていれば即座に抽出
   const directCoords = extractCoordinatesFromText(extractedUrl || rawText);
   if (directCoords) {
     const placeName = candidateName || extractPlaceNameFromUrl(extractedUrl || rawText) || '指定された目的地';
@@ -263,7 +268,7 @@ async function resolveGoogleMapsTarget(rawInput, sharedTitle = '') {
     throw new Error('コピーされたテキストにGoogleマップのURL（https://...）が見つかりませんでした。');
   }
 
-  // 2. `/api/resolve-url` へ送信（Next.js サーバー稼働時）
+  // `/api/resolve-url` へ送信（Next.jsサーバー環境の場合）
   try {
     const apiRes = await fetch(`./api/resolve-url?url=${encodeURIComponent(extractedUrl)}`, {
       method: 'GET',
@@ -284,11 +289,9 @@ async function resolveGoogleMapsTarget(rawInput, sharedTitle = '') {
         }
       }
     }
-  } catch (_) {
-    // GitHub Pages 等の静的ホスティングでは下のプロキシ展開へ進む
-  }
+  } catch (_) {}
 
-  // 3. GitHub Pages（静的環境）向け：CORS対応プロキシ経由で短縮URLを展開＆HTML/Preview解析
+  // GitHub Pages（静的環境）向け：CORS対応プロキシ経由で短縮URLを展開＆HTML/Preview解析
   const proxyHtmlRes = await fetchViaCorsProxies(extractedUrl);
   if (proxyHtmlRes) {
     const cleanedHtml = proxyHtmlRes.text
@@ -336,21 +339,33 @@ async function resolveGoogleMapsTarget(rawInput, sharedTitle = '') {
 async function fetchViaCorsProxies(targetUrl) {
   const attempts = [
     async () => {
-      const res = await fetch(`https://r.jina.ai/${targetUrl}`, {
-        headers: { 'X-Return-Format': 'html', 'X-Engine': 'direct' },
-      });
+      const res = await withTimeout(
+        fetch(`https://r.jina.ai/${targetUrl}`, {
+          headers: { 'X-Return-Format': 'html', 'X-Engine': 'direct' },
+        }),
+        8000,
+        'Timeout'
+      );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return { text: await res.text(), finalUrl: targetUrl };
     },
     async () => {
-      const res = await fetch(`https://r.jina.ai/${targetUrl}`, {
-        headers: { 'X-Return-Format': 'text' },
-      });
+      const res = await withTimeout(
+        fetch(`https://r.jina.ai/${targetUrl}`, {
+          headers: { 'X-Return-Format': 'text' },
+        }),
+        8000,
+        'Timeout'
+      );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return { text: await res.text(), finalUrl: targetUrl };
     },
     async () => {
-      const res = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`);
+      const res = await withTimeout(
+        fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`),
+        8000,
+        'Timeout'
+      );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return { text: await res.text(), finalUrl: targetUrl };
     },
@@ -389,7 +404,7 @@ function extractPlaceNameFromPreviewJson(previewText) {
 }
 
 // ==========================================
-// 3. 距離（Haversine公式）と方位角（Bearing）の計算（要件5）
+// 3. 距離（Haversine公式）と方位角（Bearing）の計算
 // ==========================================
 
 function calculateHaversineDistanceMeters(lat1, lng1, lat2, lng2) {
@@ -433,12 +448,9 @@ function formatDistance(meters) {
 }
 
 // ==========================================
-// 4. 電子コンパス・GPS・Screen Wake Lock 制御（要件5・要件6）
+// 4. 電子コンパス・GPS・Screen Wake Lock 制御
 // ==========================================
 
-/**
- * 要件6: 計測中は画面が自動スリープしないよう、`navigator.wakeLock.request('screen')` を有効化する
- */
 async function requestScreenWakeLock() {
   if (!('wakeLock' in navigator)) return;
   try {
@@ -457,8 +469,8 @@ document.addEventListener('visibilitychange', () => {
 });
 
 /**
- * 要件5: 電子コンパス（スマホの向き）の取得
- * - iOSの場合: `deviceorientation` イベントの `webkitCompassHeading`（真北=0°、時計回り）を使用
+ * 電子コンパス（スマホの向き）の取得
+ * - iOSの場合: `webkitCompassHeading`（真北=0°、時計回り）を使用
  * - Android等の場合: `deviceorientationabsolute`（非対応なら `deviceorientation`）の `alpha` を使用し、`(360 - alpha) % 360` で北基準の角度に変換
  */
 function handleDeviceOrientation(event) {
@@ -478,20 +490,30 @@ function handleDeviceOrientation(event) {
 
 let absoluteOrientationBound = false;
 let fallbackOrientationBound = false;
+let hasReceivedAbsoluteEvent = false;
 
 function registerCompassListeners() {
   if ('ondeviceorientationabsolute' in window && !absoluteOrientationBound) {
-    window.addEventListener('deviceorientationabsolute', handleDeviceOrientation, true);
+    window.addEventListener(
+      'deviceorientationabsolute',
+      (event) => {
+        if (event.alpha !== null && event.alpha !== undefined) {
+          hasReceivedAbsoluteEvent = true;
+          handleDeviceOrientation(event);
+        }
+      },
+      true
+    );
     absoluteOrientationBound = true;
   }
+
   if ('ondeviceorientation' in window && !fallbackOrientationBound) {
     window.addEventListener(
       'deviceorientation',
       (event) => {
-        if (typeof event.webkitCompassHeading === 'number' || !event.absolute) {
-          if (typeof event.webkitCompassHeading === 'number' || state.heading === null) {
-            handleDeviceOrientation(event);
-          }
+        // iOS (webkitCompassHeadingあり) または Android でまだ absolute イベントが来ていない場合に処理
+        if (typeof event.webkitCompassHeading === 'number' || !hasReceivedAbsoluteEvent) {
+          handleDeviceOrientation(event);
         }
       },
       true
@@ -528,15 +550,15 @@ function startGeolocationWatch() {
     (err) => {
       let msg = '位置情報の取得に失敗しました。';
       if (err.code === 1) msg = '位置情報の利用が許可されていません。ブラウザ設定から許可してください。';
-      else if (err.code === 2) msg = '現在地を特定できませんでした。';
-      else if (err.code === 3) msg = '位置情報の取得がタイムアウトしました。';
-      els.gpsAccuracyText.textContent = 'エラー';
+      else if (err.code === 2) msg = '現在地を特定できませんでした（屋外や窓際でお試しください）。';
+      else if (err.code === 3) msg = '位置情報の取得がタイムアウトしました。再試行しています...';
+      els.gpsAccuracyText.textContent = '再測位中';
       showToast(msg, true);
     },
     {
       enableHighAccuracy: true,
-      maximumAge: 0,
-      timeout: 15000,
+      maximumAge: 2000,
+      timeout: 20000,
     }
   );
 }
@@ -553,48 +575,39 @@ function activateTrackingServices() {
 }
 
 // ==========================================
-// 5. ワンタップ開始ボタン（要件2【超重要：iOS SafariのUser Activation制約を回避する実装順序】）
+// 5. ワンタップ開始ボタン（iOS / Android 両対応）
 // ==========================================
 
-/**
- * 要件2: 「コピーしたリンクから開始」ボタンのクリックハンドラ
- * 1. 最優先（同期的）: typeof DeviceOrientationEvent.requestPermission === 'function' の場合、他の非同期処理より先に呼び出す
- * 2. 並行または直後: navigator.clipboard.readText() を実行してクリップボードのテキストを取得する
- * 3. 正規表現 https?://[^\s]+ でURL抽出
- * 4. /api/resolve-url で座標を取得し、即座にトラッキング画面へ切り替え
- * 5. 万が一クリップボードの読み取りが拒否または失敗した場合は、手動ペースト用の入力欄を展開・フォーカス
- */
 async function onOneTapClipboardStartClick() {
-  // 1. 最優先（同期的）: 他の await を一切挟まずに DeviceOrientationEvent.requestPermission() を呼び出す
+  // 1. 最優先（同期的）: iOS Safari の User Activation 制約を回避するため、最初に同期的に requestPermission() を呼ぶ
   const permissionPromise =
     typeof window.DeviceOrientationEvent !== 'undefined' &&
     typeof window.DeviceOrientationEvent.requestPermission === 'function'
-      ? window.DeviceOrientationEvent.requestPermission()
+      ? window.DeviceOrientationEvent.requestPermission().catch(() => 'granted')
       : Promise.resolve('granted');
 
-  // 2. 並行または直後: User Activation が有効な同一ティック内で navigator.clipboard.readText() も呼び出す
+  // 2. 並行または直後: クリップボード読み取りを開始（ポップアップ放置で永久ハングしないよう12秒タイムアウト付き）
   const clipboardPromise =
     navigator.clipboard && typeof navigator.clipboard.readText === 'function'
-      ? navigator.clipboard.readText()
+      ? withTimeout(navigator.clipboard.readText(), 12000, 'Clipboard timeout')
       : Promise.reject(new Error('Clipboard API unavailable'));
+
+  // Android 等でも即座に GPS (watchPosition) とコンパスイベントの待受を開始する
+  activateTrackingServices();
 
   els.btnStartFromClipboard.disabled = true;
   els.btnStartFromClipboardLabel.textContent = 'リンクを解析中...';
-  showToast('コンパスの有効化とコピーしたリンクの解析を行っています...', false, 0);
+  showToast('コピーしたリンクを読み取っています...', false, 0);
 
-  // コンパス権限の結果を処理してセンサーを開始
+  // iOS端末で明示的にコンパス権限が拒否された場合のみ案内を出す（Androidでは誤検知させない）
   try {
     const permState = await permissionPromise;
-    if (permState === 'granted') {
-      activateTrackingServices();
-    } else {
-      showToast('コンパスの利用が拒否されました。Safariを再読み込みして許可してください。', true);
+    if (permState !== 'granted' && isIOSDevice()) {
+      showToast('iOSコンパスの権限が拒否されました。Safariを再読み込みして許可してください。', true, 6000);
     }
-  } catch (_) {
-    activateTrackingServices();
-  }
+  } catch (_) {}
 
-  // クリップボードのテキストからURLを抽出して目的地をセット
+  // クリップボードからテキスト取得 -> 正規表現でURL抽出 -> 座標解決
   try {
     const clipText = await clipboardPromise;
     if (!clipText || !clipText.trim()) {
@@ -605,12 +618,15 @@ async function onOneTapClipboardStartClick() {
     setAndSaveDestination(target);
     showToast(`目的地「${target.name}」へのナビを開始しました！`, false, 3500);
   } catch (err) {
-    // 5. フォールバック: 手動ペースト用の入力欄を展開してフォーカスする
+    // クリップボードが空だった場合、もし前回の目的地（例：玉の湯）が保存されていればそれをセットしつつ手動入力欄も開く
+    if (!state.destination && state.savedDestination) {
+      setAndSaveDestination(state.savedDestination);
+    }
     openManualInputAndFocus();
     showToast(
-      'クリップボードを読み取れませんでした。下の入力欄にリンクをペーストしてください（コンパスは有効化済みです）。',
+      'クリップボードの読み取りがブロックされたか空でした。下の入力欄にGoogleマップのリンクを貼り付けて「開始」を押してください。',
       true,
-      6000
+      6500
     );
   } finally {
     els.btnStartFromClipboard.disabled = false;
@@ -619,29 +635,31 @@ async function onOneTapClipboardStartClick() {
 }
 
 /**
- * 要件3 & 要件6: すでに目的地がセットされている状態（Android共有起動時・前回の目的地再開時）のワンタップ開始
+ * すでに目的地がセットされている状態（Android共有起動時・前回の目的地「〇〇」で再開ボタンタップ時）のワンタップ開始
  */
 async function onStartWithTargetClick(targetObj) {
-  // 1. 最優先（同期的）: DeviceOrientationEvent.requestPermission() を呼び出す
+  // 1. 最優先（同期的）: iOS向けに requestPermission() を呼び出す
   const permissionPromise =
     typeof window.DeviceOrientationEvent !== 'undefined' &&
     typeof window.DeviceOrientationEvent.requestPermission === 'function'
-      ? window.DeviceOrientationEvent.requestPermission()
+      ? window.DeviceOrientationEvent.requestPermission().catch(() => 'granted')
       : Promise.resolve('granted');
 
   if (targetObj) {
     setAndSaveDestination(targetObj);
   }
 
+  // 即座にGPSとコンパスを開始
+  activateTrackingServices();
+
   try {
     const permState = await permissionPromise;
-    if (permState !== 'granted') {
-      showToast('コンパスの利用が拒否されました。Safariを再読み込みして許可してください。', true);
+    if (permState !== 'granted' && isIOSDevice()) {
+      showToast('iOSコンパスの利用が拒否されました。Safariを再読み込みして許可してください。', true);
       return;
     }
   } catch (_) {}
 
-  activateTrackingServices();
   showToast(`「${state.destination?.name || '目的地'}」へのリアルタイム計測を開始しました！`, false, 3000);
 }
 
@@ -748,7 +766,6 @@ function updateNavigationUI() {
     const bDeg = Math.round(bearing);
     els.bearingText.textContent = `${bDeg}° (${degToCompassDirection(bearing)})`;
 
-    // 要件5: (目的地の方位角 Bearing - 端末の向き Heading + 360) % 360 で相対角度を算出
     const effectiveHeading = state.heading !== null ? state.heading : 0;
     const relativeAngle = ((bearing - effectiveHeading + 360) % 360 + 360) % 360;
 
@@ -761,18 +778,22 @@ function updateNavigationUI() {
 }
 
 // ==========================================
-// 7. 初期化（Android共有クエリ自動解析 & イベント登録）
+// 7. 初期化
 // ==========================================
 
 function initApp() {
   if ('serviceWorker' in navigator && window.location.protocol.startsWith('http')) {
-    navigator.serviceWorker.register('./sw.js').catch(() => {});
+    navigator.serviceWorker.register('./sw.js?v=3.0').catch(() => {});
   }
 
   loadSavedDestinationFromStorage();
 
-  // 要件3: URLクエリパラメータ（?url=..., ?text=..., ?q=...）付きでページが開かれた場合は、
-  // 自動でURLを抽出して目的地座標をセット済みの状態で待機し、「コンパスを有効にして開始」のワンタップだけで計測が始まるようにする
+  // Android ではページ読み込み時点からコンパスイベントを先行登録しておく（ボタンタップ前でも方角が取れるようにする）
+  if (!isIOSDevice()) {
+    registerCompassListeners();
+  }
+
+  // URLクエリパラメータ（?url=..., ?text=..., ?q=...）付きで開かれた場合の自動解析
   const params = new URLSearchParams(window.location.search);
   const sharedUrl = params.get('url') || '';
   const sharedText = params.get('text') || '';
@@ -827,19 +848,14 @@ function initApp() {
 
   els.manualUrlForm.addEventListener('submit', async (e) => {
     e.preventDefault();
-    // 手動フォームの「開始」ボタンでも、コンパス未開始なら最優先で同期的に requestPermission() を呼ぶ
     if (!state.sensorsStarted) {
-      const permPromise =
+      if (
         typeof window.DeviceOrientationEvent !== 'undefined' &&
         typeof window.DeviceOrientationEvent.requestPermission === 'function'
-          ? window.DeviceOrientationEvent.requestPermission()
-          : Promise.resolve('granted');
-      try {
-        const perm = await permPromise;
-        if (perm === 'granted') activateTrackingServices();
-      } catch (_) {
-        activateTrackingServices();
+      ) {
+        window.DeviceOrientationEvent.requestPermission().catch(() => {});
       }
+      activateTrackingServices();
     }
 
     const raw = els.manualUrlInput.value;
@@ -863,11 +879,14 @@ function initApp() {
     btn.addEventListener('click', async () => {
       const sample = btn.getAttribute('data-sample');
       if (!sample) return;
+      if (!state.sensorsStarted) {
+        activateTrackingServices();
+      }
       els.manualUrlInput.value = sample;
       try {
         const target = await resolveGoogleMapsTarget(sample);
         setAndSaveDestination(target);
-        showToast(`サンプル「${target.name}」をセットしました！`, false, 2500);
+        showToast(`サンプル「${target.name}」をセットして計測を開始しました！`, false, 2500);
       } catch (err) {
         showToast(err.message || '解析エラー', true);
       }
