@@ -1,9 +1,8 @@
 /**
- * 目的地コンパス Ver 4.0 (Android / iOS 高感度コンパス追従版)
- * - Androidで deviceorientation と deviceorientationabsolute の競合や、
- *   Generic Sensor API (AbsoluteOrientationSensor / RelativeOrientationSensor) を網羅して
- *   確実にリアルタイムでスマホの向き(Heading)を追従し続けるよう改善
- * - requestAnimationFrame ループによる滑らかな60fpsコンパス補間描画
+ * 目的地コンパス Ver 5.0 (Android / iOS 3次元チルト補正 ＆ センサー自動診断機能付き)
+ * - Androidネイティブの SensorManager.getRotationMatrixFromVector + getOrientation と同等の
+ *   3軸オイラー角 (alpha, beta, gamma) 回転行列によるチルト補正付き真北方位角計算を実装
+ * - Brave等のプライバシー保護ブラウザでモーションセンサーがブロックされている場合の自動検知・手動スライダー補助機能を搭載
  */
 
 const STORAGE_LAST_DEST_KEY = 'map_compass_last_dest_v2';
@@ -13,14 +12,15 @@ const state = {
   savedDestination: null, // localStorageから読み込んだ前回の目的地
   currentPos: null,       // { lat, lng, accuracy, timestamp }
   heading: null,          // 0 - 360 (真北=0, 時計回り)
-  headingSource: '',      // 'ios' | 'absolute' | 'sensor' | 'relative' | 'gps'
-  lastAbsoluteTime: 0,    // 最後に absolute イベントを受け取った時刻
+  headingSource: '',      // 'ios' | 'abs-event' | 'abs-sensor' | 'rel-event' | 'rel-sensor' | 'gps' | 'manual'
+  sensorEventCount: 0,
+  lastAbsoluteTime: 0,
   bearing: null,          // 0 - 360 (現在地から見た目的地の真北基準方位)
   distanceMeters: null,
   watchId: null,
   sensorsStarted: false,
   wakeLockSentinel: null,
-  displayedArrowAngle: 0, // 0°と360°の境界で1回転しないための連続角度
+  displayedArrowAngle: 0,
   displayedRoseAngle: 0,
 };
 
@@ -110,9 +110,6 @@ function isValidLatLng(lat, lng) {
   );
 }
 
-/**
- * 0°と360°の境界で矢印が1回転してしまわないよう、最短差分で連続角度を更新する
- */
 function smoothAngleTransition(currentContinuousAngle, targetNormalizedDeg) {
   const currentMod = ((currentContinuousAngle % 360) + 360) % 360;
   let diff = targetNormalizedDeg - currentMod;
@@ -448,7 +445,7 @@ function formatDistance(meters) {
 }
 
 // ==========================================
-// 4. 電子コンパス（マルチセンサー対応）・GPS・Screen Wake Lock 制御
+// 4. 3次元チルト補正付き電子コンパス（Android TYPE_ROTATION_VECTOR 同等アルゴリズム）
 // ==========================================
 
 async function requestScreenWakeLock() {
@@ -469,8 +466,47 @@ document.addEventListener('visibilitychange', () => {
 });
 
 /**
- * 画面の向き（縦・横）のオフセットを取得
+ * W3C DeviceOrientation 仕様の 3次元オイラー角 (alpha, beta, gamma) から
+ * スマホを傾けて持っていても正確なコンパス方位角 (0〜360°, 北=0, 東=90) を計算する公式
+ * （単純な 360 - alpha だと、スマホを30°〜60°傾けて持った時にジンバルロックで値が暴れる問題を解決）
  */
+function computeTiltCompensatedCompassHeading(alpha, beta, gamma) {
+  const degToRad = Math.PI / 180;
+  const _x = (beta || 0) * degToRad;
+  const _y = (gamma || 0) * degToRad;
+  const _z = (alpha || 0) * degToRad;
+
+  const cX = Math.cos(_x);
+  const cY = Math.cos(_y);
+  const cZ = Math.cos(_z);
+  const sX = Math.sin(_x);
+  const sY = Math.sin(_y);
+  const sZ = Math.sin(_z);
+
+  // 画面法線ベクトルを地球座標系へ投影した水平成分 (Vx, Vy)
+  const Vx = -cZ * sY - sZ * sX * cY;
+  const Vy = -sZ * sY + cZ * sX * cY;
+
+  // スマホをほぼ水平（机の上など）に置いている時は画面上辺ベクトル (Ux, Uy) を使う
+  const normV = Math.hypot(Vx, Vy);
+  if (normV < 0.15) {
+    // 水平置き時は単純な (360 - alpha) に画面回転オフセットを加える
+    const screenAngle = getScreenOrientationOffset();
+    return (360 - alpha + screenAngle + 360) % 360;
+  }
+
+  let compassHeadingRad = Math.atan(Vx / Vy);
+  if (Vy < 0) {
+    compassHeadingRad += Math.PI;
+  } else if (Vx < 0) {
+    compassHeadingRad += 2 * Math.PI;
+  }
+
+  const compassHeadingDeg = compassHeadingRad * (180 / Math.PI);
+  const screenAngle = getScreenOrientationOffset();
+  return (compassHeadingDeg + screenAngle + 360) % 360;
+}
+
 function getScreenOrientationOffset() {
   if (typeof window === 'undefined') return 0;
   if (window.screen && window.screen.orientation && typeof window.screen.orientation.angle === 'number') {
@@ -483,91 +519,147 @@ function getScreenOrientationOffset() {
 }
 
 /**
- * クォータニオン [x, y, z, w] から北基準のコンパス方位角 (0〜360°) を算出（Android AbsoluteOrientationSensor用）
+ * Android Generic Sensor API (AbsoluteOrientationSensor / RelativeOrientationSensor) の
+ * クォータニオン [x, y, z, w] から Android SensorManager.getOrientation() と全く同じ回転行列を計算して方位角を出す
  */
-function quaternionToCompassHeading(q) {
+function quaternionToAndroidAzimuth(q) {
   if (!Array.isArray(q) || q.length < 4) return null;
-  const [x, y, z, w] = q;
-  // Z軸回りのヨー角 (alpha)
-  const siny_cosp = 2 * (w * z + x * y);
-  const cosy_cosp = 1 - 2 * (y * y + z * z);
-  const yawRad = Math.atan2(siny_cosp, cosy_cosp);
-  const yawDeg = (yawRad * 180) / Math.PI;
+  const [qx, qy, qz, qw] = q;
+
+  // 回転行列 R の要素 (Android SensorManager.getRotationMatrixFromVector と同一)
+  const sq_qx = 2 * qx * qx;
+  const sq_qy = 2 * qy * qy;
+  const sq_qz = 2 * qz * qz;
+  const qx_qy = 2 * qx * qy;
+  const qz_qw = 2 * qz * qw;
+  const qx_qz = 2 * qx * qz;
+  const qy_qw = 2 * qy * qw;
+  const qy_qz = 2 * qy * qz;
+  const qx_qw = 2 * qx * qw;
+
+  const R1 = qx_qy - qz_qw;
+  const R4 = 1 - sq_qx - sq_qz;
+  const R7 = qy_qz + qx_qw;
+
+  // スマホが垂直近くまで立てられている場合は画面法線ベースにリマップ
+  let azimuthRad;
+  if (Math.abs(R7) > 0.85) {
+    const R2 = qx_qz + qy_qw;
+    const R5 = qy_qz - qx_qw;
+    azimuthRad = Math.atan2(-R2, -R5);
+  } else {
+    // Android SensorManager.getOrientation: orientationAngles[0] = atan2(R[1], R[4])
+    azimuthRad = Math.atan2(R1, R4);
+  }
+
+  let azimuthDeg = (azimuthRad * 180) / Math.PI;
+  if (azimuthDeg < 0) azimuthDeg += 360;
+
   const screenOffset = getScreenOrientationOffset();
-  return (360 - yawDeg + screenOffset + 360) % 360;
+  return (azimuthDeg + screenOffset + 360) % 360;
 }
 
 /**
- * スマホの向き (Heading) を更新して即座にUIへ反映する
+ * カメラやコンパス特有の微小な揺れを抑えるローパスフィルタ（円周上の指数移動平均）
  */
+function applyLowPassFilter(prevDeg, nextDeg, alphaWeight = 0.35) {
+  if (prevDeg === null || prevDeg === undefined || Number.isNaN(prevDeg)) {
+    return nextDeg;
+  }
+  let diff = nextDeg - prevDeg;
+  if (diff > 180) diff -= 360;
+  if (diff < -180) diff += 360;
+  return ((prevDeg + diff * alphaWeight) % 360 + 360) % 360;
+}
+
 function applyNewHeading(rawHeading, sourceName) {
   if (typeof rawHeading !== 'number' || Number.isNaN(rawHeading)) return;
-  state.heading = ((rawHeading % 360) + 360) % 360;
+  const normalized = ((rawHeading % 360) + 360) % 360;
+  state.heading = applyLowPassFilter(state.heading, normalized, 0.4);
   state.headingSource = sourceName;
+  state.sensorEventCount += 1;
   updateNavigationUI();
 }
 
 let listenersRegistered = false;
-let orientationSensorInstance = null;
+let absSensorInstance = null;
+let relSensorInstance = null;
+let sensorCheckTimer = null;
 
 function registerCompassListeners() {
   if (listenersRegistered) return;
   listenersRegistered = true;
 
-  // 1. deviceorientationabsolute (Android Chrome 標準の真北コンパスイベント)
+  // 1. deviceorientationabsolute (Android Chrome 等)
   window.addEventListener(
     'deviceorientationabsolute',
     (event) => {
       if (event.alpha !== null && event.alpha !== undefined && !Number.isNaN(event.alpha)) {
         state.lastAbsoluteTime = Date.now();
-        const screenOffset = getScreenOrientationOffset();
-        const heading = (360 - event.alpha + screenOffset + 360) % 360;
-        applyNewHeading(heading, 'absolute');
+        const heading = computeTiltCompensatedCompassHeading(event.alpha, event.beta, event.gamma);
+        applyNewHeading(heading, 'abs-event');
       }
     },
     true
   );
 
-  // 2. deviceorientation (iOS webkitCompassHeading および Android で absolute が止まった/非対応時の継続イベント)
+  // 2. deviceorientation (iOS webkitCompassHeading および Android フォールバック)
   window.addEventListener(
     'deviceorientation',
     (event) => {
-      // 2-A. iOS Safari: webkitCompassHeading (真北=0°, 時計回り)
+      // iOS Safari
       if (typeof event.webkitCompassHeading === 'number' && !Number.isNaN(event.webkitCompassHeading)) {
+        state.lastAbsoluteTime = Date.now();
         applyNewHeading(event.webkitCompassHeading, 'ios');
         return;
       }
 
-      // 2-B. Android 等: 直近 800ms 以内に deviceorientationabsolute が正常に連続発火している場合はそちらを優先し、
-      // 初回だけで止まった場合や非対応端末ではこちらの alpha を継続利用して固まるのを防ぐ
+      // Android 等: 直近 600ms 以内に absolute イベントが来ていない場合に使用
       if (event.alpha !== null && event.alpha !== undefined && !Number.isNaN(event.alpha)) {
-        const now = Date.now();
-        if (event.absolute === true || now - state.lastAbsoluteTime > 800) {
-          const screenOffset = getScreenOrientationOffset();
-          const heading = (360 - event.alpha + screenOffset + 360) % 360;
-          applyNewHeading(heading, event.absolute ? 'absolute' : 'relative');
+        if (event.absolute === true || Date.now() - state.lastAbsoluteTime > 600) {
+          if (event.absolute === true) state.lastAbsoluteTime = Date.now();
+          const heading = computeTiltCompensatedCompassHeading(event.alpha, event.beta, event.gamma);
+          applyNewHeading(heading, event.absolute ? 'abs-event' : 'rel-event');
         }
       }
     },
     true
   );
 
-  // 3. Android Generic Sensor API (AbsoluteOrientationSensor) によるハードウェア直接取得バックアップ
+  // 3. Android Generic Sensor API (AbsoluteOrientationSensor & RelativeOrientationSensor)
   try {
-    if ('AbsoluteOrientationSensor' in window && !orientationSensorInstance) {
+    if ('AbsoluteOrientationSensor' in window && !absSensorInstance) {
       const SensorClass = window.AbsoluteOrientationSensor;
-      orientationSensorInstance = new SensorClass({ frequency: 30, referenceFrame: 'screen' });
-      orientationSensorInstance.addEventListener('reading', () => {
-        // 他のイベントが直近500ms来ていない場合にバックアップとして駆動
-        if (Date.now() - state.lastAbsoluteTime > 500 && orientationSensorInstance.quaternion) {
-          const h = quaternionToCompassHeading(orientationSensorInstance.quaternion);
+      absSensorInstance = new SensorClass({ frequency: 30, referenceFrame: 'device' });
+      absSensorInstance.addEventListener('reading', () => {
+        if (absSensorInstance.quaternion) {
+          state.lastAbsoluteTime = Date.now();
+          const h = quaternionToAndroidAzimuth(absSensorInstance.quaternion);
           if (h !== null) {
-            applyNewHeading(h, 'sensor');
+            applyNewHeading(h, 'abs-sensor');
           }
         }
       });
-      orientationSensorInstance.addEventListener('error', () => {});
-      orientationSensorInstance.start();
+      absSensorInstance.addEventListener('error', () => {});
+      absSensorInstance.start();
+    }
+  } catch (_) {}
+
+  try {
+    if ('RelativeOrientationSensor' in window && !relSensorInstance) {
+      const RelClass = window.RelativeOrientationSensor;
+      relSensorInstance = new RelClass({ frequency: 30, referenceFrame: 'device' });
+      relSensorInstance.addEventListener('reading', () => {
+        // Absolute センサーやイベントが 800ms 以上来ていない場合のみ Relative センサーで補完
+        if (Date.now() - state.lastAbsoluteTime > 800 && relSensorInstance.quaternion) {
+          const h = quaternionToAndroidAzimuth(relSensorInstance.quaternion);
+          if (h !== null) {
+            applyNewHeading(h, 'rel-sensor');
+          }
+        }
+      });
+      relSensorInstance.addEventListener('error', () => {});
+      relSensorInstance.start();
     }
   } catch (_) {}
 }
@@ -592,8 +684,12 @@ function startGeolocationWatch() {
         accuracy: pos.coords.accuracy,
         timestamp: pos.timestamp,
       };
-      // 磁気センサーが無い端末で移動中の場合のみ GPS heading を利用
-      if (state.heading === null && typeof pos.coords.heading === 'number' && !Number.isNaN(pos.coords.heading)) {
+      // 磁気センサーが発火していない場合でも、歩行・移動中なら GPS heading で向きを更新
+      if (
+        (state.heading === null || state.headingSource === 'gps') &&
+        typeof pos.coords.heading === 'number' &&
+        !Number.isNaN(pos.coords.heading)
+      ) {
         applyNewHeading(pos.coords.heading, 'gps');
       }
       updateNavigationUI();
@@ -623,6 +719,19 @@ function activateTrackingServices() {
   els.primaryCtaSection.hidden = true;
   els.sensorStatusBadge.textContent = 'GPS・コンパス連動中';
   els.sensorStatusBadge.classList.add('active');
+
+  // 3秒後にセンサーイベントが1回も届いていない場合は、ブラウザのモーションセンサー設定または磁気センサー非搭載を案内
+  if (sensorCheckTimer) clearTimeout(sensorCheckTimer);
+  sensorCheckTimer = setTimeout(() => {
+    if (state.sensorEventCount === 0) {
+      els.sensorStatusBadge.textContent = 'GPS連動中（磁気センサー応答なし）';
+      showToast(
+        'スマホの磁気センサー信号がブラウザから届いていません。Chromeの「サイトの設定 > モーションセンサー」が許可されているかご確認ください（北を上にした地図モードで矢印を表示中です）。',
+        true,
+        8000
+      );
+    }
+  }, 3200);
 }
 
 // ==========================================
@@ -630,14 +739,12 @@ function activateTrackingServices() {
 // ==========================================
 
 async function onOneTapClipboardStartClick() {
-  // 1. 最優先（同期的）: iOS Safari の User Activation 制約を回避するため、最初に同期的に requestPermission() を呼ぶ
   const permissionPromise =
     typeof window.DeviceOrientationEvent !== 'undefined' &&
     typeof window.DeviceOrientationEvent.requestPermission === 'function'
       ? window.DeviceOrientationEvent.requestPermission().catch(() => 'granted')
       : Promise.resolve('granted');
 
-  // 2. 並行または直後: クリップボード読み取りを開始（12秒タイムアウト付き）
   const clipboardPromise =
     navigator.clipboard && typeof navigator.clipboard.readText === 'function'
       ? withTimeout(navigator.clipboard.readText(), 12000, 'Clipboard timeout')
@@ -779,7 +886,7 @@ function updateNavigationUI() {
     state.displayedRoseAngle = smoothAngleTransition(state.displayedRoseAngle, targetRoseDeg);
     els.compassRose.style.transform = `rotate(${state.displayedRoseAngle.toFixed(1)}deg)`;
   } else {
-    els.headingText.textContent = '--° (--)';
+    els.headingText.textContent = '--° (北固定)';
   }
 
   if (state.destination && state.currentPos) {
@@ -820,15 +927,62 @@ function updateNavigationUI() {
 }
 
 // ==========================================
-// 7. 初期化
+// 7. 初期化（タッチドラッグによるコンパス手動回転サポート付き）
 // ==========================================
+
+function initTouchCompassRotate() {
+  if (!els.compassBezel) return;
+  let isDragging = false;
+
+  const getTouchAngle = (clientX, clientY) => {
+    const rect = els.compassBezel.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const rad = Math.atan2(clientX - cx, -(clientY - cy));
+    return ((rad * 180) / Math.PI + 360) % 360;
+  };
+
+  let startTouchAngle = 0;
+  let startHeading = 0;
+
+  els.compassBezel.addEventListener(
+    'touchstart',
+    (e) => {
+      // 磁気センサーが機能していない場合、コンパス盤面を指でなぞって北の向きを合わせられるようにする
+      if (state.sensorEventCount === 0 && e.touches.length === 1) {
+        isDragging = true;
+        startTouchAngle = getTouchAngle(e.touches[0].clientX, e.touches[0].clientY);
+        startHeading = state.heading || 0;
+      }
+    },
+    { passive: true }
+  );
+
+  els.compassBezel.addEventListener(
+    'touchmove',
+    (e) => {
+      if (!isDragging || e.touches.length !== 1) return;
+      const curAngle = getTouchAngle(e.touches[0].clientX, e.touches[0].clientY);
+      const delta = curAngle - startTouchAngle;
+      state.heading = (startHeading - delta + 360) % 360;
+      state.headingSource = 'manual';
+      updateNavigationUI();
+    },
+    { passive: true }
+  );
+
+  els.compassBezel.addEventListener('touchend', () => {
+    isDragging = false;
+  });
+}
 
 function initApp() {
   if ('serviceWorker' in navigator && window.location.protocol.startsWith('http')) {
-    navigator.serviceWorker.register('./sw.js?v=4.0').catch(() => {});
+    navigator.serviceWorker.register('./sw.js?v=5.0').catch(() => {});
   }
 
   loadSavedDestinationFromStorage();
+  initTouchCompassRotate();
 
   if (!isIOSDevice()) {
     registerCompassListeners();
