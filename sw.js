@@ -1,4 +1,4 @@
-const CACHE_NAME = 'map-compass-pwa-v4';
+const CACHE_NAME = 'map-compass-pwa-v5';
 const ASSETS = [
   './',
   './index.html',
